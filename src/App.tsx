@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import {
   clearStoredAuth,
@@ -10,7 +10,17 @@ import {
 import { SpotifyClient } from './lib/spotifyClient'
 import { formatDateTime, formatDuration } from './lib/formatters'
 
-type SortField = 'name' | 'mainArtist' | 'album' | 'addedAt' | 'popularity' | 'durationMs'
+type SortField =
+  | 'name'
+  | 'mainArtist'
+  | 'album'
+  | 'addedAt'
+  | 'popularity'
+  | 'durationMs'
+  | 'tempo'
+  | 'valence'
+  | 'camelot'
+  | 'key'
 
 interface SortRule {
   id: string
@@ -29,6 +39,7 @@ interface PlaylistSummary {
 
 interface TrackRow {
   id: string
+  spotifyId: string | null
   uri: string
   name: string
   artists: string
@@ -38,6 +49,12 @@ interface TrackRow {
   durationMs: number
   addedAt: string
   originalIndex: number
+  tempo: number | null
+  valence: number | null
+  keyName: string | null
+  keyIndex: number | null
+  camelot: string | null
+  camelotOrder: number | null
 }
 
 interface BannerMessage {
@@ -92,6 +109,72 @@ interface SpotifyPlaylistTracksResponse {
   next: string | null
 }
 
+interface SpotifyAudioFeature {
+  id: string
+  tempo: number | null
+  valence: number | null
+  key: number | null
+  mode: number | null
+}
+
+interface SpotifyAudioFeaturesResponse {
+  audio_features: Array<SpotifyAudioFeature | null>
+}
+
+const PITCH_CLASSES = [
+  'C',
+  'C♯/D♭',
+  'D',
+  'D♯/E♭',
+  'E',
+  'F',
+  'F♯/G♭',
+  'G',
+  'G♯/A♭',
+  'A',
+  'A♯/B♭',
+  'B',
+]
+
+const CAMELOT_MAJOR = ['8B', '3B', '10B', '5B', '12B', '7B', '2B', '9B', '4B', '11B', '6B', '1B']
+const CAMELOT_MINOR = ['5A', '12A', '7A', '2A', '9A', '4A', '11A', '6A', '1A', '8A', '3A', '10A']
+
+function parseCamelotOrder(camelot: string | null) {
+  if (!camelot) return Number.POSITIVE_INFINITY
+  const match = camelot.match(/^(\d{1,2})([AB])$/)
+  if (!match) return Number.POSITIVE_INFINITY
+  const number = Number(match[1])
+  if (!Number.isFinite(number)) return Number.POSITIVE_INFINITY
+  const letterOffset = match[2] === 'B' ? 1 : 0
+  return (number - 1) * 2 + letterOffset
+}
+
+function getKeyMetadata(feature: SpotifyAudioFeature | null) {
+  if (!feature || feature.key == null || feature.mode == null) {
+    return {
+      name: null as string | null,
+      index: null as number | null,
+      camelot: null as string | null,
+      camelotOrder: null as number | null,
+    }
+  }
+  const key = feature.key
+  if (key < 0 || key > 11) {
+    return {
+      name: null,
+      index: null,
+      camelot: null,
+      camelotOrder: null,
+    }
+  }
+  const isMajor = feature.mode === 1
+  const name = `${PITCH_CLASSES[key]} ${isMajor ? 'major' : 'minor'}`
+  const index = (isMajor ? 0 : 12) + key
+  const camelot = (isMajor ? CAMELOT_MAJOR : CAMELOT_MINOR)[key] ?? null
+  const camelotOrder = parseCamelotOrder(camelot)
+  return { name, index, camelot, camelotOrder }
+}
+
 const sortFieldOptions: Record<SortField, { label: string; description: string }> = {
   name: {
     label: 'Tên bài hát',
@@ -116,6 +199,22 @@ const sortFieldOptions: Record<SortField, { label: string; description: string }
   durationMs: {
     label: 'Thời lượng',
     description: 'Sắp xếp theo thời lượng bài hát.',
+  },
+  tempo: {
+    label: 'Nhịp (BPM)',
+    description: 'Sắp xếp theo tốc độ nhịp điệu của bài hát.',
+  },
+  valence: {
+    label: 'Mức độ tươi vui',
+    description: 'Sắp xếp theo chỉ số cảm xúc (valence) từ Spotify.',
+  },
+  camelot: {
+    label: 'Camelot',
+    description: 'Sắp xếp theo vòng khóa Camelot dành cho DJ.',
+  },
+  key: {
+    label: 'Khoá nhạc',
+    description: 'Sắp xếp theo khóa nhạc (key) của bài hát.',
   },
 }
 
@@ -256,6 +355,7 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
   const [playlistInput, setPlaylistInput] = useState('')
   const [tracks, setTracks] = useState<TrackRow[]>([])
   const [isLoadingTracks, setIsLoadingTracks] = useState(false)
+  const [isLoadingAudioFeatures, setIsLoadingAudioFeatures] = useState(false)
   const [sortRules, setSortRules] = useState<SortRule[]>(defaultSortRules)
   const [banner, setBanner] = useState<BannerMessage | null>(null)
   const [isCreatePanelOpen, setIsCreatePanelOpen] = useState(false)
@@ -263,6 +363,8 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
   const [newPlaylistDescription, setNewPlaylistDescription] = useState('')
   const [isPublic, setIsPublic] = useState(false)
   const [isCreatingPlaylist, setIsCreatingPlaylist] = useState(false)
+
+  const selectedPlaylistRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!banner) return
@@ -302,6 +404,38 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
           case 'durationMs':
             comparison = compareNumbers(a.durationMs, b.durationMs)
             break
+          case 'tempo': {
+            const fallback =
+              rule.direction === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+            const aTempo = a.tempo ?? fallback
+            const bTempo = b.tempo ?? fallback
+            comparison = aTempo === bTempo ? 0 : aTempo - bTempo
+            break
+          }
+          case 'valence': {
+            const fallback =
+              rule.direction === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+            const aValence = a.valence ?? fallback
+            const bValence = b.valence ?? fallback
+            comparison = aValence === bValence ? 0 : aValence - bValence
+            break
+          }
+          case 'camelot': {
+            const fallback =
+              rule.direction === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+            const aOrder = a.camelotOrder ?? fallback
+            const bOrder = b.camelotOrder ?? fallback
+            comparison = aOrder === bOrder ? 0 : aOrder - bOrder
+            break
+          }
+          case 'key': {
+            const fallback =
+              rule.direction === 'asc' ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+            const aKey = a.keyIndex ?? fallback
+            const bKey = b.keyIndex ?? fallback
+            comparison = aKey === bKey ? 0 : aKey - bKey
+            break
+          }
           default:
             comparison = 0
         }
@@ -377,9 +511,66 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
     }
   }, [client, selectedPlaylist, setUserFacingError])
 
+  const enrichTracksWithAudioFeatures = useCallback(
+    async (baseTracks: TrackRow[], playlistId: string) => {
+      const ids = baseTracks
+        .map((track) => track.spotifyId)
+        .filter((id): id is string => Boolean(id))
+      if (!ids.length) return
+
+      setIsLoadingAudioFeatures(true)
+      try {
+        const featuresMap = new Map<string, SpotifyAudioFeature>()
+        for (const chunk of chunkArray(ids, 100)) {
+          const response = await client.get<SpotifyAudioFeaturesResponse>(
+            `/audio-features?ids=${chunk.join(',')}`,
+          )
+          for (const feature of response.audio_features) {
+            if (feature?.id) {
+              featuresMap.set(feature.id, feature)
+            }
+          }
+        }
+
+        if (!featuresMap.size) return
+
+        setTracks((current) => {
+          if (selectedPlaylistRef.current !== playlistId) return current
+          return current.map((track) => {
+            if (!track.spotifyId) return track
+            const feature = featuresMap.get(track.spotifyId)
+            if (!feature) return track
+            const { name, index, camelot, camelotOrder } = getKeyMetadata(feature)
+            return {
+              ...track,
+              tempo: feature.tempo ?? null,
+              valence: feature.valence ?? null,
+              keyName: name,
+              keyIndex: index,
+              camelot,
+              camelotOrder,
+            }
+          })
+        })
+      } catch (error) {
+        setUserFacingError(
+          error instanceof Error
+            ? error.message
+            : 'Không thể lấy thông tin audio features cho playlist này.',
+        )
+      } finally {
+        if (selectedPlaylistRef.current === playlistId) {
+          setIsLoadingAudioFeatures(false)
+        }
+      }
+    },
+    [client, setUserFacingError],
+  )
+
   const fetchPlaylistTracks = useCallback(
     async (playlist: PlaylistSummary) => {
       setIsLoadingTracks(true)
+      setIsLoadingAudioFeatures(false)
       try {
         const collected: TrackRow[] = []
         let url: string | null = `/playlists/${playlist.id}/tracks?limit=100`
@@ -388,8 +579,10 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
           const response: SpotifyPlaylistTracksResponse = await client.get(url)
           for (const item of response.items) {
             if (!item.track || !item.track.uri) continue
+            const spotifyId = item.track.id
             collected.push({
-              id: item.track.id ?? `${playlist.id}-${index}`,
+              id: spotifyId ?? `${playlist.id}-${index}`,
+              spotifyId: spotifyId ?? null,
               uri: item.track.uri,
               name: item.track.name,
               artists:
@@ -401,6 +594,12 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
               durationMs: item.track.duration_ms ?? 0,
               addedAt: item.added_at,
               originalIndex: index,
+              tempo: null,
+              valence: null,
+              keyName: null,
+              keyIndex: null,
+              camelot: null,
+              camelotOrder: null,
             })
             index += 1
           }
@@ -416,6 +615,7 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
           type: 'info',
           message: `Đã tải ${collected.length} bài hát từ “${playlist.name}”.`,
         })
+        void enrichTracksWithAudioFeatures(collected, playlist.id)
       } catch (error) {
         setUserFacingError(
           error instanceof Error ? error.message : 'Không thể tải track của playlist này.',
@@ -424,7 +624,7 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
         setIsLoadingTracks(false)
       }
     },
-    [client, setUserFacingError],
+    [client, enrichTracksWithAudioFeatures, setUserFacingError],
   )
 
   useEffect(() => {
@@ -440,6 +640,10 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
       void fetchPlaylistTracks(selectedPlaylist)
     }
   }, [fetchPlaylistTracks, selectedPlaylist])
+
+  useEffect(() => {
+    selectedPlaylistRef.current = selectedPlaylist?.id ?? null
+  }, [selectedPlaylist])
 
   const handleSelectPlaylist = (playlist: PlaylistSummary) => {
     setSelectedPlaylist(playlist)
@@ -578,10 +782,10 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
         {banner ? (
           <div
             className={`mt-8 rounded-2xl border px-4 py-3 text-sm backdrop-blur ${banner.type === 'success'
-                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
-                : banner.type === 'error'
-                  ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
-                  : 'border-brand-500/40 bg-brand-500/10 text-brand-100'
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+              : banner.type === 'error'
+                ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                : 'border-brand-500/40 bg-brand-500/10 text-brand-100'
               }`}
           >
             {banner.message}
@@ -652,8 +856,8 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
                         type="button"
                         onClick={() => handleSelectPlaylist(playlist)}
                         className={`w-full rounded-2xl border px-4 py-3 text-left transition ${isActive
-                            ? 'border-brand-500/70 bg-brand-500/10 text-white shadow-glow'
-                            : 'border-white/5 bg-slate-950/40 text-slate-200 hover:border-brand-500/40 hover:bg-slate-900/60'
+                          ? 'border-brand-500/70 bg-brand-500/10 text-white shadow-glow'
+                          : 'border-white/5 bg-slate-950/40 text-slate-200 hover:border-brand-500/40 hover:bg-slate-900/60'
                           }`}
                       >
                         <p className="font-medium text-sm truncate">{playlist.name}</p>
@@ -793,52 +997,81 @@ function Dashboard({ tokenSet, onTokenChange }: DashboardProps) {
             <div className="bg-slate-950/70 backdrop-blur p-6 border border-white/5 rounded-3xl">
               <div className="flex justify-between items-center">
                 <h3 className="font-semibold text-white text-lg">Danh sách bài hát đã sắp xếp</h3>
-                <span className="text-slate-500 text-xs">
-                  {sortedTracks.length} bài hát
-                </span>
+                <div className="flex items-center gap-3">
+                  <span className="text-slate-500 text-xs">
+                    {sortedTracks.length} bài hát
+                  </span>
+                  {isLoadingAudioFeatures ? (
+                    <span className="inline-flex items-center gap-2 px-3 py-1 border border-white/10 rounded-full text-slate-300 text-xs">
+                      <span className="inline-flex bg-brand-400 rounded-full w-2 h-2 animate-pulse" />
+                      Đang phân tích audio…
+                    </span>
+                  ) : null}
+                </div>
               </div>
               <div className="mt-4 border border-white/5 rounded-2xl overflow-hidden">
-                <table className="divide-y divide-white/5 min-w-full text-slate-200 text-sm text-left">
-                  <thead className="bg-white/5 text-slate-400 text-xs uppercase tracking-wider">
-                    <tr>
-                      <th className="px-4 py-3 font-medium">#</th>
-                      <th className="px-4 py-3 font-medium">Tên bài hát</th>
-                      <th className="px-4 py-3 font-medium">Nghệ sĩ</th>
-                      <th className="px-4 py-3 font-medium">Album</th>
-                      <th className="px-4 py-3 font-medium">Ngày thêm</th>
-                      <th className="px-4 py-3 font-medium text-right">Độ phổ biến</th>
-                      <th className="px-4 py-3 font-medium text-right">Thời lượng</th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-slate-950/40 divide-y divide-white/5">
-                    {sortedTracks.map((track, index) => (
-                      <tr key={`${track.id}-${track.originalIndex}`} className="hover:bg-slate-900/60">
-                        <td className="px-4 py-3 text-slate-500 text-xs whitespace-nowrap">{index + 1}</td>
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-white">{track.name}</div>
-                        </td>
-                        <td className="px-4 py-3 text-slate-300 text-sm">{track.artists}</td>
-                        <td className="px-4 py-3 text-slate-400 text-sm">{track.album}</td>
-                        <td className="px-4 py-3 text-slate-400 text-sm">{formatDateTime(track.addedAt)}</td>
-                        <td className="px-4 py-3 text-slate-300 text-sm text-right">
-                          {track.popularity ?? '—'}
-                        </td>
-                        <td className="px-4 py-3 text-slate-200 text-sm text-right">
-                          {formatDuration(track.durationMs)}
-                        </td>
-                      </tr>
-                    ))}
-                    {!sortedTracks.length ? (
+                <div className="overflow-x-auto">
+                  <table className="divide-y divide-white/5 min-w-full text-slate-200 text-sm text-left">
+                    <thead className="bg-white/5 text-slate-400 text-xs uppercase tracking-wider">
                       <tr>
-                        <td colSpan={7} className="px-6 py-12 text-slate-500 text-sm text-center">
-                          {isLoadingTracks
-                            ? 'Đang tải dữ liệu playlist…'
-                            : 'Chưa có dữ liệu. Hãy chọn một playlist ở cột bên trái.'}
-                        </td>
+                        <th className="px-4 py-3 font-medium">#</th>
+                        <th className="px-4 py-3 font-medium">Tên bài hát</th>
+                        <th className="px-4 py-3 font-medium">Nghệ sĩ</th>
+                        <th className="px-4 py-3 font-medium">Album</th>
+                        <th className="px-4 py-3 font-medium">Ngày thêm</th>
+                        <th className="px-4 py-3 font-medium text-right">Độ phổ biến</th>
+                        <th className="px-4 py-3 font-medium text-right">Thời lượng</th>
+                        <th className="px-4 py-3 font-medium text-right">Nhịp (BPM)</th>
+                        <th className="px-4 py-3 font-medium text-right">Happy</th>
+                        <th className="px-4 py-3 font-medium">Camelot</th>
+                        <th className="px-4 py-3 font-medium">Khoá nhạc</th>
                       </tr>
-                    ) : null}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody className="bg-slate-950/40 divide-y divide-white/5">
+                      {sortedTracks.map((track, index) => (
+                        <tr
+                          key={`${track.id}-${track.originalIndex}`}
+                          className="hover:bg-slate-900/60"
+                        >
+                          <td className="px-4 py-3 text-slate-500 text-xs whitespace-nowrap">
+                            {index + 1}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="font-medium text-white">{track.name}</div>
+                          </td>
+                          <td className="px-4 py-3 text-slate-300 text-sm">{track.artists}</td>
+                          <td className="px-4 py-3 text-slate-400 text-sm">{track.album}</td>
+                          <td className="px-4 py-3 text-slate-400 text-sm">
+                            {formatDateTime(track.addedAt)}
+                          </td>
+                          <td className="px-4 py-3 text-slate-300 text-sm text-right">
+                            {track.popularity ?? '—'}
+                          </td>
+                          <td className="px-4 py-3 text-slate-200 text-sm text-right">
+                            {formatDuration(track.durationMs)}
+                          </td>
+                          <td className="px-4 py-3 text-slate-200 text-sm text-right">
+                            {track.tempo != null ? Math.round(track.tempo) : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-slate-200 text-sm text-right">
+                            {track.valence != null ? `${Math.round(track.valence * 100)}%` : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-slate-300 text-sm">{track.camelot ?? '—'}</td>
+                          <td className="px-4 py-3 text-slate-300 text-sm">{track.keyName ?? '—'}</td>
+                        </tr>
+                      ))}
+                      {!sortedTracks.length ? (
+                        <tr>
+                          <td colSpan={11} className="px-6 py-12 text-slate-500 text-sm text-center">
+                            {isLoadingTracks
+                              ? 'Đang tải dữ liệu playlist…'
+                              : 'Chưa có dữ liệu. Hãy chọn một playlist ở cột bên trái.'}
+                          </td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
 

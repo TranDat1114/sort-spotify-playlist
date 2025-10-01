@@ -6,7 +6,7 @@
 
 - 🔐 **Đăng nhập Spotify** bằng Authorization Code + PKCE, không cần server riêng.
 - 📚 **Tự động lấy playlist** của tài khoản và dán liên kết playlist bất kỳ mà bạn có quyền truy cập.
-- 🧮 **Sắp xếp nhiều tiêu chí cùng lúc** (tên bài hát, nghệ sĩ, album, ngày thêm, độ phổ biến, thời lượng) với thứ tự ưu tiên linh hoạt.
+- 🧮 **Sắp xếp nhiều tiêu chí cùng lúc** (tên bài hát, nghệ sĩ, album, ngày thêm, độ phổ biến, thời lượng, BPM, Happy/Valence, Camelot, Key) với thứ tự ưu tiên linh hoạt.
 - 🆕 **Tạo playlist mới** từ danh sách đã sắp xếp, tùy chỉnh tên, mô tả và quyền công khai.
 - 🎨 **Giao diện Tailwind CSS 4.1**: khoảng trắng hài hòa, điểm nhấn gradient, hỗ trợ theme tối.
 
